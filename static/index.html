@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>FastAPI Web Manager</title>
+    <!-- Xterm.js for the Terminal UI -->
+    <link rel="stylesheet" href="https://unpkg.com/xterm/css/xterm.css" />
+    <script src="https://unpkg.com/xterm/lib/xterm.js"></script>
+    <style>
+        body { font-family: system-ui, sans-serif; display: flex; height: 100vh; margin: 0; background: #1e1e1e; color: #fff;}
+        .panel { flex: 1; padding: 20px; display: flex; flex-direction: column; border-right: 1px solid #333;}
+        h2 { margin-top: 0; font-size: 1.2rem;}
+        #file-list { flex: 1; overflow-y: auto; background: #2d2d2d; padding: 10px; border-radius: 4px;}
+        .file-item { padding: 8px; border-bottom: 1px solid #444; display: flex; justify-content: space-between; }
+        .file-item a { color: #4facfe; text-decoration: none; }
+        .dir { color: #f6a152; font-weight: bold; }
+        #terminal-container { flex: 1; height: 100%; background: #000; padding: 10px; border-radius: 4px; }
+        input[type="file"] { margin-top: 10px; }
+    </style>
+</head>
+<body>
+
+    <!-- File Manager Panel -->
+    <div class="panel">
+        <h2>File Manager</h2>
+        <div id="file-list"></div>
+        <input type="file" id="file-upload" onchange="uploadFile()">
+    </div>
+
+    <!-- Terminal Panel -->
+    <div class="panel">
+        <h2>Terminal</h2>
+        <div id="terminal-container"></div>
+    </div>
+
+    <script>
+        // ==========================================
+        // FILE MANAGER LOGIC
+        // ==========================================
+        let currentPath = "";
+
+        async function loadFiles() {
+            const res = await fetch(`/api/files?path=${currentPath}`);
+            const files = await res.json();
+            const list = document.getElementById("file-list");
+            list.innerHTML = "";
+            
+            files.forEach(f => {
+                const div = document.createElement("div");
+                div.className = "file-item";
+                if (f.is_dir) {
+                    div.innerHTML = `<span class="dir">📁 ${f.name}</span>`;
+                } else {
+                    div.innerHTML = `<span>📄 ${f.name}</span> <a href="/api/download?path=${currentPath}/${f.name}" download>Download</a>`;
+                }
+                list.appendChild(div);
+            });
+        }
+
+        async function uploadFile() {
+            const input = document.getElementById("file-upload");
+            if (!input.files[0]) return;
+
+            const formData = new FormData();
+            formData.append("file", input.files[0]);
+
+            await fetch(`/api/upload?path=${currentPath}`, { method: "POST", body: formData });
+            input.value = ""; 
+            loadFiles(); // Refresh list
+        }
+
+        loadFiles();
+
+        // ==========================================
+        // TERMINAL LOGIC (xterm.js)
+        // ==========================================
+        const term = new Terminal({ theme: { background: '#000' } });
+        term.open(document.getElementById('terminal-container'));
+        term.write('Welcome to FastAPI Terminal\r\n$ ');
+
+        const ws = new WebSocket(`ws://${window.location.host}/ws/terminal`);
+        let commandBuffer = "";
+
+        // Handle incoming data from backend
+        ws.onmessage = (event) => {
+            // Replace newlines to fit xterm's expected \r\n formatting
+            const output = event.data.replace(/\n/g, "\r\n");
+            term.write(output);
+        };
+
+        // Handle user typing
+        term.onData(e => {
+            if (e === '\r') { // Enter key
+                term.write('\r\n');
+                ws.send(commandBuffer);
+                commandBuffer = "";
+            } else if (e === '\u007F') { // Backspace
+                if (commandBuffer.length > 0) {
+                    commandBuffer = commandBuffer.slice(0, -1);
+                    term.write('\b \b');
+                }
+            } else { // Standard typing
+                commandBuffer += e;
+                term.write(e);
+            }
+        });
+    </script>
+</body>
+</html>
