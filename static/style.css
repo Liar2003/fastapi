@@ -1,0 +1,314 @@
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #0f1117;
+    color: #f5f7fa;
+    font-family:
+        Inter,
+        system-ui,
+        -apple-system,
+        sans-serif;
+}
+
+.header {
+    min-height: 80px;
+    padding: 18px 28px;
+
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+
+    border-bottom: 1px solid #272b35;
+
+    background: #151821;
+}
+
+.header h1 {
+    margin: 0 0 5px;
+    font-size: 21px;
+}
+
+#currentPath {
+    color: #8d95a5;
+    font-size: 13px;
+}
+
+.header-actions {
+    display: flex;
+    gap: 10px;
+}
+
+button,
+.upload-btn {
+    border: 1px solid #303643;
+    background: #202530;
+    color: #fff;
+
+    padding: 10px 15px;
+
+    border-radius: 9px;
+
+    cursor: pointer;
+
+    font-size: 14px;
+}
+
+button:hover,
+.upload-btn:hover {
+    background: #2a303d;
+}
+
+.primary {
+    background: #4f7cff;
+    border-color: #4f7cff;
+}
+
+.primary:hover {
+    background: #3d6be8;
+}
+
+main {
+    max-width: 1200px;
+    margin: auto;
+    padding: 25px;
+}
+
+.stats {
+    display: grid;
+    grid-template-columns:
+        repeat(3, 1fr);
+
+    gap: 15px;
+
+    margin-bottom: 20px;
+}
+
+.stat {
+    padding: 20px;
+
+    border: 1px solid #292e39;
+    border-radius: 12px;
+
+    background: #171a22;
+}
+
+.stat span {
+    display: block;
+    color: #8d95a5;
+    font-size: 13px;
+}
+
+.stat strong {
+    display: block;
+    margin-top: 8px;
+    font-size: 25px;
+}
+
+.toolbar {
+    margin-bottom: 15px;
+}
+
+#search {
+    width: 100%;
+
+    padding: 13px 15px;
+
+    border: 1px solid #303643;
+    border-radius: 9px;
+
+    background: #171a22;
+    color: #fff;
+
+    outline: none;
+}
+
+.file-container {
+    overflow: hidden;
+
+    border: 1px solid #292e39;
+    border-radius: 12px;
+
+    background: #171a22;
+}
+
+.file-header,
+.file-row {
+    display: grid;
+
+    grid-template-columns:
+        minmax(200px, 1fr)
+        130px
+        230px;
+
+    align-items: center;
+}
+
+.file-header {
+    padding: 14px 18px;
+
+    color: #8d95a5;
+
+    border-bottom: 1px solid #292e39;
+
+    font-size: 13px;
+}
+
+.file-row {
+    padding: 13px 18px;
+
+    border-bottom: 1px solid #232732;
+}
+
+.file-row:last-child {
+    border-bottom: none;
+}
+
+.file-name {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+
+    cursor: pointer;
+}
+
+.file-icon {
+    font-size: 22px;
+}
+
+.file-size {
+    color: #8d95a5;
+    font-size: 13px;
+}
+
+.actions {
+    display: flex;
+    gap: 7px;
+}
+
+.actions button {
+    padding: 7px 10px;
+    font-size: 12px;
+}
+
+.empty {
+    padding: 60px;
+    text-align: center;
+    color: #777f90;
+}
+
+.modal {
+    position: fixed;
+
+    inset: 0;
+
+    background: rgba(0, 0, 0, .75);
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    padding: 20px;
+}
+
+.hidden {
+    display: none;
+}
+
+.modal-content {
+    width: min(900px, 100%);
+
+    background: #171a22;
+
+    border: 1px solid #303643;
+
+    border-radius: 14px;
+
+    overflow: hidden;
+}
+
+.modal-header {
+    padding: 15px 18px;
+
+    display: flex;
+    justify-content: space-between;
+
+    border-bottom: 1px solid #292e39;
+}
+
+.modal-header h2 {
+    margin: 0;
+    font-size: 17px;
+}
+
+.editor textarea {
+    width: 100%;
+
+    min-height: 500px;
+
+    resize: vertical;
+
+    padding: 18px;
+
+    border: 0;
+
+    outline: none;
+
+    background: #0c0e13;
+    color: #e8ebf0;
+
+    font-family:
+        "JetBrains Mono",
+        monospace;
+
+    font-size: 14px;
+
+    line-height: 1.6;
+}
+
+.modal-footer {
+    padding: 12px 18px;
+
+    display: flex;
+    justify-content: flex-end;
+
+    gap: 10px;
+
+    border-top: 1px solid #292e39;
+}
+
+@media (max-width: 700px) {
+
+    .header {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 15px;
+    }
+
+    .header-actions {
+        flex-wrap: wrap;
+    }
+
+    main {
+        padding: 15px;
+    }
+
+    .stats {
+        grid-template-columns: 1fr;
+    }
+
+    .file-header {
+        display: none;
+    }
+
+    .file-row {
+        grid-template-columns: 1fr;
+        gap: 10px;
+    }
+
+    .actions {
+        flex-wrap: wrap;
+    }
+}

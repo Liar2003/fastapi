@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>File Manager</title>
+
+    <link
+        rel="stylesheet"
+        href="/static/style.css"
+    >
+</head>
+
+<body>
+
+<header class="header">
+
+    <div>
+        <h1>📁 File Manager</h1>
+        <span id="currentPath">/</span>
+    </div>
+
+    <div class="header-actions">
+
+        <button onclick="goBack()">
+            ← Back
+        </button>
+
+        <button onclick="createFolder()">
+            + Folder
+        </button>
+
+        <label class="upload-btn">
+            ⬆ Upload
+            <input
+                type="file"
+                id="fileInput"
+                multiple
+                hidden
+            >
+        </label>
+
+    </div>
+
+</header>
+
+
+<main>
+
+    <section class="stats">
+
+        <div class="stat">
+            <span>Files</span>
+            <strong id="fileCount">0</strong>
+        </div>
+
+        <div class="stat">
+            <span>Folders</span>
+            <strong id="folderCount">0</strong>
+        </div>
+
+        <div class="stat">
+            <span>Storage</span>
+            <strong id="storageSize">0 B</strong>
+        </div>
+
+    </section>
+
+
+    <section class="toolbar">
+
+        <input
+            id="search"
+            type="search"
+            placeholder="Search files..."
+            oninput="renderFiles()"
+        >
+
+    </section>
+
+
+    <section class="file-container">
+
+        <div class="file-header">
+            <span>Name</span>
+            <span>Size</span>
+            <span>Actions</span>
+        </div>
+
+        <div id="fileList"></div>
+
+    </section>
+
+</main>
+
+
+<!-- Editor -->
+
+<div
+    id="editorModal"
+    class="modal hidden"
+>
+
+    <div class="modal-content editor">
+
+        <div class="modal-header">
+
+            <h2 id="editorTitle">
+                Edit file
+            </h2>
+
+            <button onclick="closeEditor()">
+                ✕
+            </button>
+
+        </div>
+
+        <textarea
+            id="editorContent"
+            spellcheck="false"
+        ></textarea>
+
+        <div class="modal-footer">
+
+            <button onclick="closeEditor()">
+                Cancel
+            </button>
+
+            <button
+                class="primary"
+                onclick="saveEditor()"
+            >
+                Save
+            </button>
+
+        </div>
+
+    </div>
+
+</div>
+
+
+<script src="/static/app.js"></script>
+
+</body>
+</html>
