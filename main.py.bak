@@ -1,356 +1,457 @@
-import os
-import pty
-import shutil
 import asyncio
+import base64
+import hashlib
+import json
+import mimetypes
+import os
+import secrets
+import shutil
+import signal
+import stat
+import subprocess
+import tempfile
+import time
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect, Query
-from fastapi.responses import HTMLResponse, FileResponse
-from pydantic import BaseModel
+from typing import Optional
 
-app = FastAPI(title="Advanced FastAPI File Manager & Terminal")
+import pty
+import select
+import struct
+import termios
+import fcntl
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
 
-# Base directory for the file browser (Defaults to current working directory)
-BASE_DIR = Path(os.getenv("BASE_DIR", ".")).resolve()
 
-def resolve_safe_path(rel_path: str) -> Path:
-    """Resolves relative path and prevents escaping BASE_DIR."""
-    target = (BASE_DIR / rel_path.lstrip("/")).resolve()
-    if not str(target).startswith(str(BASE_DIR)):
-        raise HTTPException(status_code=403, detail="Access denied: Outside root scope.")
-    return target
+APP_DIR = Path(__file__).resolve().parent
+ROOT_DIR = Path(os.getenv("FILE_ROOT", str(APP_DIR / "data"))).expanduser().resolve()
+ROOT_DIR.mkdir(parents=True, exist_ok=True)
+AUDIT_FILE = Path(os.getenv("AUDIT_FILE", str(APP_DIR / "data" / ".audit.jsonl"))).expanduser().resolve()
+ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change-me")
+SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
+SESSION_MAX_AGE = int(os.getenv("SESSION_MAX_AGE", "28800"))
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(500 * 1024 * 1024)))
+TERMINAL_SHELL = os.getenv("TERMINAL_SHELL", "/bin/bash")
 
-# --- Pydantic Models ---
-class CreateFolderSchema(BaseModel):
-    path: str
-    folder_name: str
+app = FastAPI(title="Secure File Manager", version="1.0.0")
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SECRET_KEY,
+    max_age=SESSION_MAX_AGE,
+    same_site="lax",
+    https_only=os.getenv("COOKIE_SECURE", "0") == "1",
+)
+app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
-class SaveFileSchema(BaseModel):
-    path: str
-    content: str
 
-class DeleteItemSchema(BaseModel):
-    path: str
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-# --- File Manager API Endpoints ---
+
+def audit(request: Optional[Request], action: str, path: str = "", details: Optional[dict] = None) -> None:
+    event = {
+        "time": utc_now(),
+        "user": (request.session.get("user") if request else "terminal"),
+        "action": action,
+        "path": path,
+        "ip": (request.client.host if request and request.client else None),
+        "details": details or {},
+    }
+    try:
+        AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with AUDIT_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def is_authenticated(request: Request) -> bool:
+    return bool(request.session.get("authenticated"))
+
+
+def require_auth(request: Request) -> Request:
+    if not is_authenticated(request):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return request
+
+
+def relative_path(path: Path) -> str:
+    return "/" if path == ROOT_DIR else "/" + path.relative_to(ROOT_DIR).as_posix()
+
+
+def safe_path(raw: str = "") -> Path:
+    raw = (raw or "").replace("\\", "/").strip()
+    if raw in ("", "/", "."):
+        candidate = ROOT_DIR
+    else:
+        candidate = (ROOT_DIR / raw.lstrip("/")).resolve()
+    if candidate != ROOT_DIR and ROOT_DIR not in candidate.parents:
+        raise HTTPException(status_code=403, detail="Path escapes the configured file root")
+    return candidate
+
+
+def safe_child(parent: Path, name: str) -> Path:
+    name = Path(name).name
+    if not name or name in {".", ".."}:
+        raise HTTPException(status_code=400, detail="Invalid name")
+    result = (parent / name).resolve()
+    if result != ROOT_DIR and ROOT_DIR not in result.parents:
+        raise HTTPException(status_code=403, detail="Path escapes the configured file root")
+    return result
+
+
+def stat_item(path: Path) -> dict:
+    info = path.stat()
+    is_dir = path.is_dir()
+    return {
+        "name": path.name,
+        "path": relative_path(path),
+        "type": "directory" if is_dir else "file",
+        "size": 0 if is_dir else info.st_size,
+        "modified": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat(),
+        "mode": stat.filemode(info.st_mode),
+        "mime": "inode/directory" if is_dir else (mimetypes.guess_type(path.name)[0] or "application/octet-stream"),
+        "hidden": path.name.startswith("."),
+    }
+
+
+def human_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, HTTPException):
+        return exc
+    if isinstance(exc, PermissionError):
+        return HTTPException(status_code=403, detail="Permission denied")
+    if isinstance(exc, FileNotFoundError):
+        return HTTPException(status_code=404, detail="File or directory not found")
+    if isinstance(exc, FileExistsError):
+        return HTTPException(status_code=409, detail="A file or directory with that name already exists")
+    return HTTPException(status_code=400, detail=str(exc) or "Operation failed")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index() -> FileResponse:
+    return FileResponse(APP_DIR / "static" / "index.html")
+
+
+@app.get("/api/session")
+async def session(request: Request):
+    return {"authenticated": is_authenticated(request), "user": request.session.get("user")}
+
+
+@app.post("/api/login")
+async def login(request: Request):
+    data = await request.json()
+    username = str(data.get("username", ""))
+    password = str(data.get("password", ""))
+    valid = secrets.compare_digest(username, ADMIN_USER) and secrets.compare_digest(password, ADMIN_PASSWORD)
+    if not valid:
+        audit(request, "login_failed", details={"username": username[:64]})
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    request.session["authenticated"] = True
+    request.session["user"] = ADMIN_USER
+    audit(request, "login")
+    return {"ok": True, "user": ADMIN_USER}
+
+
+@app.post("/api/logout")
+async def logout(request: Request):
+    audit(request, "logout")
+    request.session.clear()
+    return {"ok": True}
+
+
+@app.get("/api/config")
+async def config(request: Request, _auth: None = Depends(require_auth)):
+    return {"root": str(ROOT_DIR), "max_upload_bytes": MAX_UPLOAD_BYTES, "terminal_shell": Path(TERMINAL_SHELL).name}
+
+
 @app.get("/api/files")
-async def list_directory(path: str = ""):
-    target = resolve_safe_path(path)
-    if not target.exists():
-        raise HTTPException(status_code=404, detail="Path not found")
-    if not target.is_dir():
-        raise HTTPException(status_code=400, detail="Path is not a directory")
-
-    items = []
-    for entry in sorted(os.scandir(target), key=lambda e: (not e.is_dir(), e.name.lower())):
-        rel = str(Path(entry.path).relative_to(BASE_DIR)).replace("\\", "/")
-        items.append({
-            "name": entry.name,
-            "path": rel,
-            "is_dir": entry.is_dir(),
-            "size": round(entry.stat().st_size / 1024, 2) if entry.is_file() else 0
-        })
-
-    current_rel = str(target.relative_to(BASE_DIR)).replace("\\", "/")
-    return {"current_path": current_rel if current_rel != "." else "", "items": items}
-
-@app.get("/api/file/read")
-async def read_file(path: str):
-    target = resolve_safe_path(path)
-    if not target.is_file():
-        raise HTTPException(status_code=400, detail="Not a file")
+async def list_files(
+    request: Request,
+    _auth: None = Depends(require_auth),
+    path: str = Query("/"),
+    show_hidden: bool = Query(False),
+    search: str = Query(""),
+):
+    directory = safe_path(path)
+    if not directory.exists() or not directory.is_dir():
+        raise HTTPException(status_code=404, detail="Directory not found")
     try:
-        content = target.read_text(encoding="utf-8")
-        return {"content": content}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Cannot read file: {str(e)}")
+        items = []
+        for item in directory.iterdir():
+            if not show_hidden and item.name.startswith("."):
+                continue
+            if search and search.lower() not in item.name.lower():
+                continue
+            try:
+                items.append(stat_item(item))
+            except OSError:
+                continue
+        items.sort(key=lambda item: (item["type"] != "directory", item["name"].lower()))
+        parent = relative_path(directory.parent) if directory != ROOT_DIR else None
+        return {"path": relative_path(directory), "parent": parent, "items": items}
+    except Exception as exc:
+        raise human_error(exc)
 
-@app.post("/api/file/save")
-async def save_file(data: SaveFileSchema):
-    target = resolve_safe_path(data.path)
+
+@app.get("/api/file")
+async def read_file(path: str, request: Request, _auth: None = Depends(require_auth)):
+    target = safe_path(path)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    if target.stat().st_size > 2 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Preview is limited to 2 MB")
     try:
-        target.write_text(data.content, encoding="utf-8")
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Cannot save file: {str(e)}")
+        data = target.read_bytes()
+        is_text = b"\x00" not in data[:8192]
+        if not is_text:
+            return {"path": relative_path(target), "binary": True, "content": ""}
+        return {"path": relative_path(target), "binary": False, "content": data.decode("utf-8", errors="replace")}
+    except Exception as exc:
+        raise human_error(exc)
 
-@app.post("/api/folder/create")
-async def create_folder(data: CreateFolderSchema):
-    target = resolve_safe_path(data.path) / data.folder_name
-    target.mkdir(parents=True, exist_ok=True)
-    return {"status": "success"}
-
-@app.post("/api/upload")
-async def upload_file(path: str = Query(""), file: UploadFile = File(...)):
-    target_dir = resolve_safe_path(path)
-    file_path = target_dir / file.filename
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    return {"status": "success"}
 
 @app.get("/api/download")
-async def download_file(path: str):
-    target = resolve_safe_path(path)
-    if not target.is_file():
+async def download_file(path: str, request: Request, _auth: None = Depends(require_auth)):
+    target = safe_path(path)
+    if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path=target, filename=target.name)
+    audit(request, "download", relative_path(target))
+    return FileResponse(target, filename=target.name, media_type=mimetypes.guess_type(target.name)[0] or "application/octet-stream")
 
-@app.post("/api/delete")
-async def delete_item(data: DeleteItemSchema):
-    target = resolve_safe_path(data.path)
+
+@app.get("/api/zip")
+async def zip_path(path: str, request: Request, _auth: None = Depends(require_auth)):
+    target = safe_path(path)
     if not target.exists():
-        raise HTTPException(status_code=404, detail="Item not found")
-    if target.is_dir():
-        shutil.rmtree(target)
-    else:
-        target.unlink()
-    return {"status": "success"}
-
-# --- WebSocket Web Terminal Endpoint (Linux/Unix PTY) ---
-@app.websocket("/ws/terminal")
-async def websocket_terminal(websocket: WebSocket):
-    await websocket.accept()
-    
-    # Spawn interactive shell inside PTY pseudo-terminal
-    master_fd, slave_fd = pty.openpty()
-    shell = os.environ.get("SHELL", "/bin/bash")
-    if not os.path.exists(shell):
-        shell = "/bin/sh"
-
-    pid = os.fork()
-    if pid == 0:
-        # Child Process
-        os.close(master_fd)
-        os.setsid()
-        os.dup2(slave_fd, 0)
-        os.dup2(slave_fd, 1)
-        os.dup2(slave_fd, 2)
-        if slave_fd > 2:
-            os.close(slave_fd)
-        os.execv(shell, [shell])
-    else:
-        # Parent Process
-        os.close(slave_fd)
-        loop = asyncio.get_running_loop()
-
-        async def read_pty():
-            try:
-                while True:
-                    data = await loop.run_in_executor(None, os.read, master_fd, 1024)
-                    if not data:
-                        break
-                    await websocket.send_text(data.decode("utf-8", errors="ignore"))
-            except Exception:
-                pass
-
-        read_task = asyncio.create_task(read_pty())
-
+        raise HTTPException(status_code=404, detail="Path not found")
+    fd, temp_name = tempfile.mkstemp(prefix="file-manager-", suffix=".zip")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(temp_name, "w", zipfile.ZIP_DEFLATED) as archive:
+            if target.is_dir():
+                for item in target.rglob("*"):
+                    if item.is_file() and item != AUDIT_FILE:
+                        archive.write(item, Path(target.name) / item.relative_to(target))
+            else:
+                archive.write(target, target.name)
+        audit(request, "zip", relative_path(target))
+        return FileResponse(temp_name, filename=f"{target.name}.zip", media_type="application/zip", background=None)
+    except Exception:
         try:
-            while True:
-                msg = await websocket.receive_text()
-                os.write(master_fd, msg.encode("utf-8"))
-        except WebSocketDisconnect:
+            os.unlink(temp_name)
+        except OSError:
             pass
-        finally:
-            read_task.cancel()
-            os.close(master_fd)
-            try:
-                os.kill(pid, 9)
-                os.waitpid(pid, 0)
-            except Exception:
-                pass
+        raise
 
-# --- Front-End Single Page Application (SPA) ---
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>FastAPI Advanced File Manager & Web Terminal</title>
-        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
-        <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
-        <style>
-            * { box-sizing: border-box; }
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 0; background: #1e1e1e; color: #d4d4d4; }
-            .header { display: flex; background: #252526; border-bottom: 1px solid #3c3c3c; }
-            .tab-btn { padding: 12px 24px; background: none; border: none; color: #888; cursor: pointer; font-size: 14px; font-weight: bold; }
-            .tab-btn.active { color: #fff; border-bottom: 2px solid #0e639c; background: #1e1e1e; }
-            .container { padding: 20px; }
-            .tab-content { display: none; }
-            .tab-content.active { display: block; }
-            .toolbar { display: flex; gap: 10px; margin-bottom: 15px; align-items: center; }
-            input[type="text"], button { padding: 8px 12px; background: #3c3c3c; border: 1px solid #555; color: white; border-radius: 4px; }
-            button { cursor: pointer; background: #0e639c; border: none; }
-            button:hover { background: #1177bb; }
-            table { width: 100%; border-collapse: collapse; background: #252526; border-radius: 6px; overflow: hidden; }
-            th, td { padding: 10px 15px; text-align: left; border-bottom: 1px solid #3c3c3c; }
-            th { background: #2d2d2d; }
-            a.item-link { color: #4ec9b0; text-decoration: none; cursor: pointer; }
-            a.item-link:hover { text-decoration: underline; }
-            #editor-modal { display:none; fixed: true; position: fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); padding: 40px; }
-            .modal-box { background:#252526; height:100%; display:flex; flex-direction:column; padding:20px; border-radius:8px; }
-            textarea { flex:1; background:#1e1e1e; color:#d4d4d4; font-family: monospace; padding:10px; border:1px solid #3c3c3c; resize:none; margin: 10px 0; }
-            #terminal-container { height: 75vh; background: #000; padding: 10px; border-radius: 6px; }
-        </style>
-    </head>
-    <body>
-        <div class="header">
-            <button class="tab-btn active" onclick="switchTab('files')">📁 File Manager</button>
-            <button class="tab-btn" onclick="switchTab('terminal')">💻 Web Terminal</button>
-        </div>
 
-        <div class="container">
-            <!-- FILE MANAGER TAB -->
-            <div id="tab-files" class="tab-content active">
-                <div class="toolbar">
-                    <button onclick="loadFiles(currentPath)">🔄 Refresh</button>
-                    <button onclick="createFolder()">📁 New Folder</button>
-                    <input type="file" id="upload-input" style="display:none" onchange="uploadFile()">
-                    <button onclick="document.getElementById('upload-input').click()">⬆️ Upload</button>
-                    <span id="breadcrumb" style="margin-left:15px; font-weight:bold;">/</span>
-                </div>
-                <table>
-                    <thead>
-                        <tr><th>Name</th><th>Size</th><th>Actions</th></tr>
-                    </thead>
-                    <tbody id="file-list"></tbody>
-                </table>
-            </div>
+@app.post("/api/folder")
+async def create_folder(request: Request, _auth: None = Depends(require_auth), path: str = Form("/"), name: str = Form(...)):
+    parent = safe_path(path)
+    try:
+        target = safe_child(parent, name)
+        target.mkdir(parents=False, exist_ok=False)
+        audit(request, "create_folder", relative_path(target))
+        return stat_item(target)
+    except Exception as exc:
+        raise human_error(exc)
 
-            <!-- TERMINAL TAB -->
-            <div id="tab-terminal" class="tab-content">
-                <div id="terminal-container"></div>
-            </div>
-        </div>
 
-        <!-- EDITOR MODAL -->
-        <div id="editor-modal">
-            <div class="modal-box">
-                <h3 id="editor-title" style="margin:0;">Edit File</h3>
-                <textarea id="editor-content"></textarea>
-                <div>
-                    <button onclick="saveFile()">Save</button>
-                    <button onclick="closeEditor()" style="background:#e74c3c">Cancel</button>
-                </div>
-            </div>
-        </div>
+@app.post("/api/upload")
+async def upload_file(request: Request, _auth: None = Depends(require_auth), path: str = Form("/"), file: UploadFile = File(...)):
+    parent = safe_path(path)
+    if not parent.is_dir():
+        raise HTTPException(status_code=404, detail="Directory not found")
+    target = safe_child(parent, file.filename or "upload.bin")
+    written = 0
+    try:
+        with target.open("wb") as output:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    output.close()
+                    target.unlink(missing_ok=True)
+                    raise HTTPException(status_code=413, detail="Upload exceeds the configured size limit")
+                output.write(chunk)
+        audit(request, "upload", relative_path(target), {"bytes": written})
+        return stat_item(target)
+    except Exception as exc:
+        target.unlink(missing_ok=True)
+        raise human_error(exc)
+    finally:
+        await file.close()
 
-        <script>
-            let currentPath = "";
-            let editingFilePath = "";
-            let term, socket;
 
-            function switchTab(tab) {
-                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-                if(tab === 'files') {
-                    document.querySelectorAll('.tab-btn')[0].classList.add('active');
-                    document.getElementById('tab-files').classList.add('active');
-                } else {
-                    document.querySelectorAll('.tab-btn')[1].classList.add('active');
-                    document.getElementById('tab-terminal').classList.add('active');
-                    if (!term) initTerminal();
-                }
-            }
+@app.post("/api/save")
+async def save_file(payload: dict, request: Request, _auth: None = Depends(require_auth)):
+    target = safe_path(str(payload.get("path", "")))
+    content = payload.get("content")
+    if not isinstance(content, str):
+        raise HTTPException(status_code=400, detail="content must be a string")
+    if len(content.encode("utf-8")) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds the configured size limit")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp = target.with_name(f".{target.name}.tmp-{secrets.token_hex(6)}")
+        temp.write_text(content, encoding="utf-8")
+        os.replace(temp, target)
+        audit(request, "save", relative_path(target), {"bytes": len(content.encode('utf-8'))})
+        return stat_item(target)
+    except Exception as exc:
+        raise human_error(exc)
 
-            async function loadFiles(path = "") {
-                currentPath = path;
-                document.getElementById('breadcrumb').innerText = "/" + path;
-                const res = await fetch(`/api/files?path=${encodeURIComponent(path)}`);
-                const data = await res.json();
-                const tbody = document.getElementById('file-list');
-                tbody.innerHTML = "";
 
-                if (path !== "") {
-                    const parentPath = path.split('/').slice(0, -1).join('/');
-                    tbody.innerHTML += `<tr><td colspan="3"><a class="item-link" onclick="loadFiles('${parentPath}')">📁 .. (Parent Directory)</a></td></tr>`;
-                }
+@app.post("/api/rename")
+async def rename_path(payload: dict, request: Request, _auth: None = Depends(require_auth)):
+    source = safe_path(str(payload.get("path", "")))
+    name = str(payload.get("name", ""))
+    if not source.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+    try:
+        target = safe_child(source.parent, name)
+        source.rename(target)
+        audit(request, "rename", relative_path(source), {"to": relative_path(target)})
+        return stat_item(target)
+    except Exception as exc:
+        raise human_error(exc)
 
-                data.items.forEach(item => {
-                    const icon = item.is_dir ? '📁' : '📄';
-                    const actionHtml = item.is_dir ? 
-                        `<button onclick="deleteItem('${item.path}')" style="background:#e74c3c">Delete</button>` :
-                        `<button onclick="openEditor('${item.path}')">Edit</button> 
-                         <a href="/api/download?path=${encodeURIComponent(item.path)}"><button style="background:#2ecc71">Download</button></a>
-                         <button onclick="deleteItem('${item.path}')" style="background:#e74c3c">Delete</button>`;
-                    
-                    const nameClick = item.is_dir ? `loadFiles('${item.path}')` : `openEditor('${item.path}')`;
-                    tbody.innerHTML += `
-                        <tr>
-                            <td>${icon} <a class="item-link" onclick="${nameClick}">${item.name}</a></td>
-                            <td>${item.is_dir ? '-' : item.size + ' KB'}</td>
-                            <td>${actionHtml}</td>
-                        </tr>`;
-                });
-            }
 
-            async function createFolder() {
-                const name = prompt("Folder name:");
-                if (!name) return;
-                await fetch('/api/folder/create', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ path: currentPath, folder_name: name })
-                });
-                loadFiles(currentPath);
-            }
+@app.post("/api/move")
+async def move_path(payload: dict, request: Request, _auth: None = Depends(require_auth)):
+    source = safe_path(str(payload.get("path", "")))
+    destination = safe_path(str(payload.get("destination", "")))
+    if not source.exists() or not destination.is_dir():
+        raise HTTPException(status_code=404, detail="Source or destination not found")
+    try:
+        target = safe_child(destination, source.name)
+        shutil.move(str(source), str(target))
+        audit(request, "move", relative_path(source), {"to": relative_path(target)})
+        return stat_item(target)
+    except Exception as exc:
+        raise human_error(exc)
 
-            async function uploadFile() {
-                const input = document.getElementById('upload-input');
-                if (!input.files[0]) return;
-                const formData = new FormData();
-                formData.append('file', input.files[0]);
-                await fetch(`/api/upload?path=${encodeURIComponent(currentPath)}`, { method: 'POST', body: formData });
-                input.value = "";
-                loadFiles(currentPath);
-            }
 
-            async function openEditor(filePath) {
-                editingFilePath = filePath;
-                const res = await fetch(`/api/file/read?path=${encodeURIComponent(filePath)}`);
-                const data = await res.json();
-                document.getElementById('editor-title').innerText = "Edit: " + filePath;
-                document.getElementById('editor-content').value = data.content;
-                document.getElementById('editor-modal').style.display = 'block';
-            }
+@app.delete("/api/file")
+async def delete_path(path: str, request: Request, _auth: None = Depends(require_auth)):
+    target = safe_path(path)
+    if target == ROOT_DIR:
+        raise HTTPException(status_code=400, detail="The root directory cannot be deleted")
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+    try:
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        audit(request, "delete", relative_path(target))
+        return {"ok": True}
+    except Exception as exc:
+        raise human_error(exc)
 
-            function closeEditor() { document.getElementById('editor-modal').style.display = 'none'; }
 
-            async function saveFile() {
-                const content = document.getElementById('editor-content').value;
-                await fetch('/api/file/save', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ path: editingFilePath, content: content })
-                });
-                closeEditor();
-                loadFiles(currentPath);
-            }
+@app.post("/api/extract")
+async def extract_archive(payload: dict, request: Request, _auth: None = Depends(require_auth)):
+    archive = safe_path(str(payload.get("path", "")))
+    if not archive.is_file() or archive.suffix.lower() != ".zip":
+        raise HTTPException(status_code=400, detail="Only ZIP archives are supported")
+    destination = safe_child(archive.parent, archive.stem)
+    try:
+        destination.mkdir(exist_ok=False)
+        with zipfile.ZipFile(archive) as zf:
+            for member in zf.infolist():
+                member_target = (destination / member.filename).resolve()
+                if member_target != destination and destination not in member_target.parents:
+                    raise HTTPException(status_code=400, detail="Archive contains an unsafe path")
+            zf.extractall(destination)
+        audit(request, "extract", relative_path(archive), {"to": relative_path(destination)})
+        return {"ok": True, "path": relative_path(destination)}
+    except Exception as exc:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise human_error(exc)
 
-            async function deleteItem(path) {
-                if(!confirm(`Delete ${path}?`)) return;
-                await fetch('/api/delete', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ path: path })
-                });
-                loadFiles(currentPath);
-            }
 
-            function initTerminal() {
-                term = new Terminal({ cursorBlink: true, theme: { background: '#000000' } });
-                term.open(document.getElementById('terminal-container'));
-                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                socket = new WebSocket(`${protocol}//${window.location.host}/ws/terminal`);
+@app.get("/api/audit")
+async def audit_log(request: Request, _auth: None = Depends(require_auth), limit: int = Query(100, ge=1, le=500)):
+    if not AUDIT_FILE.exists():
+        return {"events": []}
+    try:
+        lines = AUDIT_FILE.read_text(encoding="utf-8").splitlines()[-limit:]
+        events = [json.loads(line) for line in reversed(lines)]
+        return {"events": events}
+    except Exception as exc:
+        raise human_error(exc)
 
-                socket.onmessage = (event) => term.write(event.data);
-                term.onData((data) => socket.send(data));
-            }
 
-            // Initial load
-            loadFiles();
-        </script>
-    </body>
-    </html>
-    """
+@app.websocket("/ws/terminal")
+async def terminal(websocket: WebSocket):
+    session = websocket.scope.get("session", {})
+    if not session.get("authenticated"):
+        await websocket.close(code=4401)
+        return
+    origin = websocket.headers.get("origin")
+    host = websocket.headers.get("host")
+    if origin and host and origin.split("//", 1)[-1].split("/", 1)[0] != host:
+        await websocket.close(code=4403)
+        return
+    await websocket.accept()
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ["TERM"] = "xterm-256color"
+        os.environ["FILE_MANAGER_ROOT"] = str(ROOT_DIR)
+        os.chdir(ROOT_DIR)
+        os.execv(TERMINAL_SHELL, [TERMINAL_SHELL, "-i"])
+    os.set_blocking(fd, False)
+    audit(None, "terminal_open")
+
+    async def send_output():
+        while True:
+            ready, _, _ = select.select([fd], [], [], 0.1)
+            if ready:
+                try:
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        break
+                    await websocket.send_text(base64.b64encode(chunk).decode("ascii"))
+                except (OSError, WebSocketDisconnect):
+                    break
+            await asyncio.sleep(0)
+
+    output_task = asyncio.create_task(send_output())
+    try:
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+            if message.get("text") is not None:
+                payload = json.loads(message["text"])
+                if payload.get("type") == "input":
+                    os.write(fd, base64.b64decode(payload.get("data", "")))
+                elif payload.get("type") == "resize":
+                    rows = max(1, min(200, int(payload.get("rows", 30))))
+                    cols = max(1, min(300, int(payload.get("cols", 120))))
+                    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    except (WebSocketDisconnect, json.JSONDecodeError, OSError):
+        pass
+    finally:
+        output_task.cancel()
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        await asyncio.sleep(0)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "time": utc_now()}
