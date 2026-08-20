@@ -1,457 +1,685 @@
-import asyncio
-import base64
-import hashlib
-import json
-import mimetypes
 import os
-import secrets
+import sys
+import json
+import asyncio
 import shutil
-import signal
-import stat
-import subprocess
-import tempfile
-import time
 import zipfile
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
-
-import pty
-import select
+import tempfile
+import subprocess
+import signal
 import struct
-import termios
 import fcntl
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
-from fastapi.staticfiles import StaticFiles
-from starlette.middleware.sessions import SessionMiddleware
+import termios
+from pathlib import Path
+from typing import List, Optional
+from datetime import datetime
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, JSONResponse
+from pydantic import BaseModel
+
+app = FastAPI(title="Advanced File Manager")
+
+# Root directory for file operations (set via env ROOT_DIR, default: home directory)
+ROOT_DIR = Path(os.getenv("ROOT_DIR", str(Path.home()))).resolve()
+if not ROOT_DIR.exists():
+    ROOT_DIR = Path.home().resolve()
+
+# -----------------------------------------------------------------------------
+# Helper functions
+# -----------------------------------------------------------------------------
+
+def safe_path(relative_path: str = "") -> Path:
+    """Resolve a relative path safely inside ROOT_DIR."""
+    rel = relative_path.lstrip("/")
+    if rel == "":
+        return ROOT_DIR
+    p = (ROOT_DIR / rel).resolve()
+    # If ROOT_DIR is "/", all paths are allowed; otherwise enforce containment
+    if str(ROOT_DIR) != "/" and not str(p).startswith(str(ROOT_DIR) + os.sep):
+        raise HTTPException(status_code=403, detail="Access denied")
+    return p
 
 
-APP_DIR = Path(__file__).resolve().parent
-ROOT_DIR = Path(os.getenv("FILE_ROOT", str(APP_DIR / "data"))).expanduser().resolve()
-ROOT_DIR.mkdir(parents=True, exist_ok=True)
-AUDIT_FILE = Path(os.getenv("AUDIT_FILE", str(APP_DIR / "data" / ".audit.jsonl"))).expanduser().resolve()
-ADMIN_USER = os.getenv("ADMIN_USER", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change-me")
-SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
-SESSION_MAX_AGE = int(os.getenv("SESSION_MAX_AGE", "28800"))
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(500 * 1024 * 1024)))
-TERMINAL_SHELL = os.getenv("TERMINAL_SHELL", "/bin/bash")
-
-app = FastAPI(title="Secure File Manager", version="1.0.0")
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=SECRET_KEY,
-    max_age=SESSION_MAX_AGE,
-    same_site="lax",
-    https_only=os.getenv("COOKIE_SECURE", "0") == "1",
-)
-app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def audit(request: Optional[Request], action: str, path: str = "", details: Optional[dict] = None) -> None:
-    event = {
-        "time": utc_now(),
-        "user": (request.session.get("user") if request else "terminal"),
-        "action": action,
-        "path": path,
-        "ip": (request.client.host if request and request.client else None),
-        "details": details or {},
-    }
+def get_relative_path(path: Path) -> str:
     try:
-        AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with AUDIT_FILE.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(event, ensure_ascii=False) + "\n")
-    except OSError:
-        pass
+        return str(path.relative_to(ROOT_DIR))
+    except ValueError:
+        return str(path)
 
 
-def is_authenticated(request: Request) -> bool:
-    return bool(request.session.get("authenticated"))
+def format_size(size: int) -> str:
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024.0:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} PB"
 
 
-def require_auth(request: Request) -> Request:
-    if not is_authenticated(request):
-        raise HTTPException(status_code=401, detail="Authentication required")
-    return request
-
-
-def relative_path(path: Path) -> str:
-    return "/" if path == ROOT_DIR else "/" + path.relative_to(ROOT_DIR).as_posix()
-
-
-def safe_path(raw: str = "") -> Path:
-    raw = (raw or "").replace("\\", "/").strip()
-    if raw in ("", "/", "."):
-        candidate = ROOT_DIR
-    else:
-        candidate = (ROOT_DIR / raw.lstrip("/")).resolve()
-    if candidate != ROOT_DIR and ROOT_DIR not in candidate.parents:
-        raise HTTPException(status_code=403, detail="Path escapes the configured file root")
-    return candidate
-
-
-def safe_child(parent: Path, name: str) -> Path:
-    name = Path(name).name
-    if not name or name in {".", ".."}:
-        raise HTTPException(status_code=400, detail="Invalid name")
-    result = (parent / name).resolve()
-    if result != ROOT_DIR and ROOT_DIR not in result.parents:
-        raise HTTPException(status_code=403, detail="Path escapes the configured file root")
-    return result
-
-
-def stat_item(path: Path) -> dict:
-    info = path.stat()
-    is_dir = path.is_dir()
+def file_info(path: Path) -> dict:
+    stat = path.stat()
     return {
         "name": path.name,
-        "path": relative_path(path),
-        "type": "directory" if is_dir else "file",
-        "size": 0 if is_dir else info.st_size,
-        "modified": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat(),
-        "mode": stat.filemode(info.st_mode),
-        "mime": "inode/directory" if is_dir else (mimetypes.guess_type(path.name)[0] or "application/octet-stream"),
-        "hidden": path.name.startswith("."),
+        "path": get_relative_path(path),
+        "is_dir": path.is_dir(),
+        "size": stat.st_size if path.is_file() else 0,
+        "size_human": format_size(stat.st_size) if path.is_file() else "",
+        "modified": datetime.fromtimestamp(stat.st_mtime).isoformat()
     }
 
 
-def human_error(exc: Exception) -> HTTPException:
-    if isinstance(exc, HTTPException):
-        return exc
-    if isinstance(exc, PermissionError):
-        return HTTPException(status_code=403, detail="Permission denied")
-    if isinstance(exc, FileNotFoundError):
-        return HTTPException(status_code=404, detail="File or directory not found")
-    if isinstance(exc, FileExistsError):
-        return HTTPException(status_code=409, detail="A file or directory with that name already exists")
-    return HTTPException(status_code=400, detail=str(exc) or "Operation failed")
+# -----------------------------------------------------------------------------
+# Frontend (single HTML page)
+# -----------------------------------------------------------------------------
 
+HTML_CONTENT = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>FastAPI File Manager</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: Arial, sans-serif; height: 100vh; display: flex; flex-direction: column; background: #1e1e1e; color: #ccc; }
+        #toolbar {
+            display: flex; align-items: center; gap: 8px; padding: 8px; background: #2d2d2d;
+            flex-wrap: wrap; border-bottom: 1px solid #444;
+        }
+        #toolbar button {
+            background: #3c3c3c; color: #ccc; border: 1px solid #555; padding: 6px 10px;
+            cursor: pointer; border-radius: 3px;
+        }
+        #toolbar button:hover { background: #505050; }
+        #pathInput {
+            flex: 1; min-width: 200px; padding: 6px; background: #1e1e1e; color: #ccc;
+            border: 1px solid #555; border-radius: 3px;
+        }
+        #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+        #filePanel { flex: 3; overflow: auto; }
+        #terminalPanel { flex: 2; border-top: 2px solid #444; background: #000; min-height: 150px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 8px; border-bottom: 1px solid #333; }
+        th { background: #2d2d2d; position: sticky; top: 0; }
+        tr:hover { background: #333; }
+        tr.selected { background: #444; }
+        .actions button { margin-right: 4px; background: #3c3c3c; color: #ccc; border: 1px solid #555; padding: 3px 6px; cursor: pointer; border-radius: 2px; }
+        .actions button:hover { background: #505050; }
+        #editorModal {
+            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center;
+        }
+        #editorBox {
+            background: #2d2d2d; padding: 20px; border-radius: 5px; width: 80%; height: 80%;
+            display: flex; flex-direction: column;
+        }
+        #editorBox textarea {
+            flex: 1; background: #1e1e1e; color: #ccc; border: 1px solid #555;
+            resize: none; font-family: monospace; padding: 10px;
+        }
+        #editorBox button { margin-top: 10px; padding: 8px; background: #3c3c3c; color: #ccc; border: 1px solid #555; cursor: pointer; }
+        #editorBox button:hover { background: #505050; }
+    </style>
+</head>
+<body>
+    <div id="toolbar">
+        <button onclick="goUp()">⬆ Up</button>
+        <button onclick="refresh()">Refresh</button>
+        <input id="pathInput" placeholder="Path" onkeydown="if(event.key==='Enter') goToPath()">
+        <button onclick="goToPath()">Go</button>
+        <span style="flex:1"></span>
+        <input type="file" id="fileInput" multiple style="display:none" onchange="uploadFiles()">
+        <button onclick="document.getElementById('fileInput').click()">Upload</button>
+        <button onclick="newFolder()">New Folder</button>
+        <button onclick="renameSelected()">Rename</button>
+        <button onclick="deleteSelected()">Delete</button>
+        <button onclick="downloadSelected()">Download</button>
+        <button onclick="copyMove('copy')">Copy To...</button>
+        <button onclick="copyMove('move')">Move To...</button>
+    </div>
+    <div id="main">
+        <div id="filePanel">
+            <table id="fileTable">
+                <thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Actions</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+        <div id="terminalPanel">
+            <div id="terminal" style="height:100%;"></div>
+        </div>
+    </div>
+
+    <div id="editorModal">
+        <div id="editorBox">
+            <h3 id="editorTitle">Edit File</h3>
+            <textarea id="editorContent" spellcheck="false"></textarea>
+            <div>
+                <button onclick="saveFile()">Save</button>
+                <button onclick="closeEditor()">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.8.0/lib/addon-fit.min.js"></script>
+    <script>
+        let currentPath = '';
+        let selectedPath = null;
+        let editingPath = null;
+
+        // ------------------------------------------------------------------
+        // File manager functions
+        // ------------------------------------------------------------------
+        function refresh() {
+            loadDir(currentPath);
+        }
+
+        function loadDir(path) {
+            fetch('/api/list?path=' + encodeURIComponent(path))
+                .then(r => r.json())
+                .then(data => {
+                    currentPath = data.current_path;
+                    document.getElementById('pathInput').value = currentPath;
+                    renderTable(data.items);
+                })
+                .catch(err => alert('Error: ' + err));
+        }
+
+        function renderTable(items) {
+            const tbody = document.querySelector('#fileTable tbody');
+            tbody.innerHTML = '';
+            items.forEach(item => {
+                const tr = document.createElement('tr');
+                tr.onclick = () => {
+                    document.querySelectorAll('#fileTable tbody tr').forEach(r => r.classList.remove('selected'));
+                    tr.classList.add('selected');
+                    selectedPath = item.path;
+                };
+                tr.ondblclick = () => {
+                    if (item.is_dir) loadDir(item.path);
+                    else downloadItem(item.path);
+                };
+                tr.innerHTML = `
+                    <td>${item.is_dir ? '📁' : '📄'} ${item.name}</td>
+                    <td>${item.size_human || ''}</td>
+                    <td>${item.modified}</td>
+                    <td class="actions">
+                        <button onclick="event.stopPropagation(); openItem('${item.path}', ${item.is_dir})">Open</button>
+                        ${!item.is_dir ? `<button onclick="event.stopPropagation(); editFile('${item.path}')">Edit</button>` : ''}
+                        <button onclick="event.stopPropagation(); renameItem('${item.path}')">Rename</button>
+                        <button onclick="event.stopPropagation(); deleteItem('${item.path}')">Delete</button>
+                        <button onclick="event.stopPropagation(); downloadItem('${item.path}')">Download</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function openItem(path, isDir) {
+            if (isDir) loadDir(path);
+            else downloadItem(path);
+        }
+
+        function goUp() {
+            if (currentPath.includes('/')) {
+                const parts = currentPath.split('/');
+                parts.pop();
+                loadDir(parts.join('/'));
+            } else {
+                loadDir('');
+            }
+        }
+
+        function goToPath() {
+            loadDir(document.getElementById('pathInput').value);
+        }
+
+        function uploadFiles() {
+            const input = document.getElementById('fileInput');
+            if (!input.files.length) return;
+            const formData = new FormData();
+            for (const file of input.files) {
+                formData.append('files', file);
+            }
+            fetch('/api/upload?path=' + encodeURIComponent(currentPath), {
+                method: 'POST',
+                body: formData
+            })
+            .then(r => r.json())
+            .then(() => {
+                input.value = '';
+                refresh();
+            })
+            .catch(err => alert('Upload failed: ' + err));
+        }
+
+        function newFolder() {
+            const name = prompt('Folder name:');
+            if (!name) return;
+            fetch('/api/mkdir', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path: currentPath, name: name})
+            })
+            .then(r => r.json())
+            .then(() => refresh())
+            .catch(err => alert('Error: ' + err));
+        }
+
+        function renameItem(path) {
+            const newName = prompt('New name:', path.split('/').pop());
+            if (!newName) return;
+            fetch('/api/rename', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path: path, new_name: newName})
+            })
+            .then(r => r.json())
+            .then(() => refresh())
+            .catch(err => alert('Error: ' + err));
+        }
+
+        function deleteItem(path) {
+            if (!confirm('Delete ' + path + '?')) return;
+            fetch('/api/delete', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path: path})
+            })
+            .then(r => r.json())
+            .then(() => refresh())
+            .catch(err => alert('Error: ' + err));
+        }
+
+        function downloadItem(path) {
+            window.location.href = '/api/download?path=' + encodeURIComponent(path);
+        }
+
+        function renameSelected() {
+            if (!selectedPath) return alert('Select an item first');
+            renameItem(selectedPath);
+        }
+
+        function deleteSelected() {
+            if (!selectedPath) return alert('Select an item first');
+            deleteItem(selectedPath);
+        }
+
+        function downloadSelected() {
+            if (!selectedPath) return alert('Select an item first');
+            downloadItem(selectedPath);
+        }
+
+        function copyMove(op) {
+            if (!selectedPath) return alert('Select an item first');
+            const dest = prompt('Destination directory path (relative to root):', currentPath);
+            if (dest === null) return;
+            fetch('/api/' + op, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({src: selectedPath, dst: dest})
+            })
+            .then(r => r.json())
+            .then(() => refresh())
+            .catch(err => alert('Error: ' + err));
+        }
+
+        function editFile(path) {
+            editingPath = path;
+            fetch('/api/read?path=' + encodeURIComponent(path))
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('editorTitle').textContent = 'Editing: ' + path;
+                    document.getElementById('editorContent').value = data.content;
+                    document.getElementById('editorModal').style.display = 'flex';
+                })
+                .catch(err => alert('Cannot read file: ' + err));
+        }
+
+        function saveFile() {
+            if (!editingPath) return;
+            const content = document.getElementById('editorContent').value;
+            fetch('/api/write', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path: editingPath, content: content})
+            })
+            .then(r => r.json())
+            .then(() => {
+                closeEditor();
+                refresh();
+            })
+            .catch(err => alert('Save failed: ' + err));
+        }
+
+        function closeEditor() {
+            document.getElementById('editorModal').style.display = 'none';
+            editingPath = null;
+        }
+
+        // ------------------------------------------------------------------
+        // Web terminal
+        // ------------------------------------------------------------------
+        const term = new Terminal({
+            cursorBlink: true,
+            fontSize: 14,
+            theme: { background: '#000000', foreground: '#cccccc' }
+        });
+        const fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        term.open(document.getElementById('terminal'));
+        fitAddon.fit();
+
+        const wsProtocol = location.protocol === 'https:' ? 'wss://' : 'ws://';
+        const ws = new WebSocket(wsProtocol + location.host + '/ws/terminal');
+
+        ws.onopen = () => {
+            term.write('\\r\\n*** Web terminal connected ***\\r\\n');
+            ws.send(JSON.stringify({type: 'resize', cols: term.cols, rows: term.rows}));
+        };
+
+        ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'output') {
+                term.write(msg.data);
+            }
+        };
+
+        ws.onclose = () => {
+            term.write('\\r\\n*** Terminal disconnected ***\\r\\n');
+        };
+
+        term.onData(data => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({type: 'input', data: data}));
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            fitAddon.fit();
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({type: 'resize', cols: term.cols, rows: term.rows}));
+            }
+        });
+
+        // Initial load
+        loadDir('');
+    </script>
+</body>
+</html>
+"""
 
 @app.get("/", response_class=HTMLResponse)
-async def index() -> FileResponse:
-    return FileResponse(APP_DIR / "static" / "index.html")
+async def index():
+    return HTMLResponse(HTML_CONTENT)
 
 
-@app.get("/api/session")
-async def session(request: Request):
-    return {"authenticated": is_authenticated(request), "user": request.session.get("user")}
+# -----------------------------------------------------------------------------
+# File API endpoints
+# -----------------------------------------------------------------------------
 
-
-@app.post("/api/login")
-async def login(request: Request):
-    data = await request.json()
-    username = str(data.get("username", ""))
-    password = str(data.get("password", ""))
-    valid = secrets.compare_digest(username, ADMIN_USER) and secrets.compare_digest(password, ADMIN_PASSWORD)
-    if not valid:
-        audit(request, "login_failed", details={"username": username[:64]})
-        raise HTTPException(status_code=401, detail="Invalid username or password")
-    request.session["authenticated"] = True
-    request.session["user"] = ADMIN_USER
-    audit(request, "login")
-    return {"ok": True, "user": ADMIN_USER}
-
-
-@app.post("/api/logout")
-async def logout(request: Request):
-    audit(request, "logout")
-    request.session.clear()
-    return {"ok": True}
-
-
-@app.get("/api/config")
-async def config(request: Request, _auth: None = Depends(require_auth)):
-    return {"root": str(ROOT_DIR), "max_upload_bytes": MAX_UPLOAD_BYTES, "terminal_shell": Path(TERMINAL_SHELL).name}
-
-
-@app.get("/api/files")
-async def list_files(
-    request: Request,
-    _auth: None = Depends(require_auth),
-    path: str = Query("/"),
-    show_hidden: bool = Query(False),
-    search: str = Query(""),
-):
-    directory = safe_path(path)
-    if not directory.exists() or not directory.is_dir():
-        raise HTTPException(status_code=404, detail="Directory not found")
+@app.get("/api/list")
+async def list_dir(path: str = ""):
+    p = safe_path(path)
+    if not p.exists():
+        raise HTTPException(404, "Path not found")
+    if not p.is_dir():
+        raise HTTPException(400, "Not a directory")
+    items = []
     try:
-        items = []
-        for item in directory.iterdir():
-            if not show_hidden and item.name.startswith("."):
-                continue
-            if search and search.lower() not in item.name.lower():
-                continue
+        for entry in sorted(p.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
             try:
-                items.append(stat_item(item))
+                items.append(file_info(entry))
             except OSError:
                 continue
-        items.sort(key=lambda item: (item["type"] != "directory", item["name"].lower()))
-        parent = relative_path(directory.parent) if directory != ROOT_DIR else None
-        return {"path": relative_path(directory), "parent": parent, "items": items}
-    except Exception as exc:
-        raise human_error(exc)
-
-
-@app.get("/api/file")
-async def read_file(path: str, request: Request, _auth: None = Depends(require_auth)):
-    target = safe_path(path)
-    if not target.exists() or not target.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
-    if target.stat().st_size > 2 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Preview is limited to 2 MB")
-    try:
-        data = target.read_bytes()
-        is_text = b"\x00" not in data[:8192]
-        if not is_text:
-            return {"path": relative_path(target), "binary": True, "content": ""}
-        return {"path": relative_path(target), "binary": False, "content": data.decode("utf-8", errors="replace")}
-    except Exception as exc:
-        raise human_error(exc)
-
-
-@app.get("/api/download")
-async def download_file(path: str, request: Request, _auth: None = Depends(require_auth)):
-    target = safe_path(path)
-    if not target.exists() or not target.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
-    audit(request, "download", relative_path(target))
-    return FileResponse(target, filename=target.name, media_type=mimetypes.guess_type(target.name)[0] or "application/octet-stream")
-
-
-@app.get("/api/zip")
-async def zip_path(path: str, request: Request, _auth: None = Depends(require_auth)):
-    target = safe_path(path)
-    if not target.exists():
-        raise HTTPException(status_code=404, detail="Path not found")
-    fd, temp_name = tempfile.mkstemp(prefix="file-manager-", suffix=".zip")
-    os.close(fd)
-    try:
-        with zipfile.ZipFile(temp_name, "w", zipfile.ZIP_DEFLATED) as archive:
-            if target.is_dir():
-                for item in target.rglob("*"):
-                    if item.is_file() and item != AUDIT_FILE:
-                        archive.write(item, Path(target.name) / item.relative_to(target))
-            else:
-                archive.write(target, target.name)
-        audit(request, "zip", relative_path(target))
-        return FileResponse(temp_name, filename=f"{target.name}.zip", media_type="application/zip", background=None)
-    except Exception:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
-
-
-@app.post("/api/folder")
-async def create_folder(request: Request, _auth: None = Depends(require_auth), path: str = Form("/"), name: str = Form(...)):
-    parent = safe_path(path)
-    try:
-        target = safe_child(parent, name)
-        target.mkdir(parents=False, exist_ok=False)
-        audit(request, "create_folder", relative_path(target))
-        return stat_item(target)
-    except Exception as exc:
-        raise human_error(exc)
+    except PermissionError:
+        raise HTTPException(403, "Permission denied")
+    return {
+        "current_path": get_relative_path(p),
+        "parent": get_relative_path(p.parent) if p != ROOT_DIR else "",
+        "items": items
+    }
 
 
 @app.post("/api/upload")
-async def upload_file(request: Request, _auth: None = Depends(require_auth), path: str = Form("/"), file: UploadFile = File(...)):
-    parent = safe_path(path)
-    if not parent.is_dir():
-        raise HTTPException(status_code=404, detail="Directory not found")
-    target = safe_child(parent, file.filename or "upload.bin")
-    written = 0
-    try:
-        with target.open("wb") as output:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                written += len(chunk)
-                if written > MAX_UPLOAD_BYTES:
-                    output.close()
-                    target.unlink(missing_ok=True)
-                    raise HTTPException(status_code=413, detail="Upload exceeds the configured size limit")
-                output.write(chunk)
-        audit(request, "upload", relative_path(target), {"bytes": written})
-        return stat_item(target)
-    except Exception as exc:
-        target.unlink(missing_ok=True)
-        raise human_error(exc)
-    finally:
-        await file.close()
+async def upload(path: str = "", files: List[UploadFile] = File(...)):
+    p = safe_path(path)
+    if not p.is_dir():
+        raise HTTPException(400, "Target is not a directory")
+    saved = []
+    for f in files:
+        # Use basename to prevent path traversal
+        filename = Path(f.filename).name
+        dest = p / filename
+        with open(dest, "wb") as buffer:
+            shutil.copyfileobj(f.file, buffer)
+        saved.append(filename)
+    return {"saved": saved}
 
 
-@app.post("/api/save")
-async def save_file(payload: dict, request: Request, _auth: None = Depends(require_auth)):
-    target = safe_path(str(payload.get("path", "")))
-    content = payload.get("content")
-    if not isinstance(content, str):
-        raise HTTPException(status_code=400, detail="content must be a string")
-    if len(content.encode("utf-8")) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="File exceeds the configured size limit")
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temp = target.with_name(f".{target.name}.tmp-{secrets.token_hex(6)}")
-        temp.write_text(content, encoding="utf-8")
-        os.replace(temp, target)
-        audit(request, "save", relative_path(target), {"bytes": len(content.encode('utf-8'))})
-        return stat_item(target)
-    except Exception as exc:
-        raise human_error(exc)
+@app.get("/api/download")
+async def download(path: str = ""):
+    p = safe_path(path)
+    if not p.exists():
+        raise HTTPException(404, "Not found")
+    if p.is_dir():
+        # Create zip stream
+        zip_buffer = tempfile.SpooledTemporaryFile()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for file in p.rglob('*'):
+                if file.is_file():
+                    zf.write(file, file.relative_to(p))
+        zip_buffer.seek(0)
+        return StreamingResponse(
+            zip_buffer,
+            media_type="application/zip",
+            headers={"Content-Disposition": f"attachment; filename={p.name}.zip"}
+        )
+    else:
+        return FileResponse(p, filename=p.name)
 
+
+class RenameRequest(BaseModel):
+    path: str
+    new_name: str
 
 @app.post("/api/rename")
-async def rename_path(payload: dict, request: Request, _auth: None = Depends(require_auth)):
-    source = safe_path(str(payload.get("path", "")))
-    name = str(payload.get("name", ""))
-    if not source.exists():
-        raise HTTPException(status_code=404, detail="Path not found")
-    try:
-        target = safe_child(source.parent, name)
-        source.rename(target)
-        audit(request, "rename", relative_path(source), {"to": relative_path(target)})
-        return stat_item(target)
-    except Exception as exc:
-        raise human_error(exc)
+async def rename(req: RenameRequest):
+    p = safe_path(req.path)
+    if not p.exists():
+        raise HTTPException(404, "Not found")
+    new_path = p.parent / req.new_name
+    if new_path.exists():
+        raise HTTPException(400, "Target already exists")
+    p.rename(new_path)
+    return {"ok": True, "new_path": get_relative_path(new_path)}
 
+
+class PathRequest(BaseModel):
+    path: str
+
+@app.post("/api/delete")
+async def delete(req: PathRequest):
+    p = safe_path(req.path)
+    if not p.exists():
+        raise HTTPException(404, "Not found")
+    if p == ROOT_DIR:
+        raise HTTPException(400, "Cannot delete root directory")
+    if p.is_dir():
+        shutil.rmtree(p)
+    else:
+        p.unlink()
+    return {"ok": True}
+
+
+class MkdirRequest(BaseModel):
+    path: str
+    name: str
+
+@app.post("/api/mkdir")
+async def mkdir(req: MkdirRequest):
+    parent = safe_path(req.path)
+    if not parent.is_dir():
+        raise HTTPException(400, "Parent is not a directory")
+    new_dir = parent / req.name
+    if new_dir.exists():
+        raise HTTPException(400, "Already exists")
+    new_dir.mkdir(parents=False)
+    return {"ok": True}
+
+
+class CopyMoveRequest(BaseModel):
+    src: str
+    dst: str
 
 @app.post("/api/move")
-async def move_path(payload: dict, request: Request, _auth: None = Depends(require_auth)):
-    source = safe_path(str(payload.get("path", "")))
-    destination = safe_path(str(payload.get("destination", "")))
-    if not source.exists() or not destination.is_dir():
-        raise HTTPException(status_code=404, detail="Source or destination not found")
+async def move(req: CopyMoveRequest):
+    src = safe_path(req.src)
+    dst_dir = safe_path(req.dst)
+    if not src.exists():
+        raise HTTPException(404, "Source not found")
+    if not dst_dir.is_dir():
+        raise HTTPException(400, "Destination is not a directory")
+    dst = dst_dir / src.name
+    if dst.exists():
+        raise HTTPException(400, "Destination already exists")
+    shutil.move(str(src), str(dst))
+    return {"ok": True}
+
+
+@app.post("/api/copy")
+async def copy(req: CopyMoveRequest):
+    src = safe_path(req.src)
+    dst_dir = safe_path(req.dst)
+    if not src.exists():
+        raise HTTPException(404, "Source not found")
+    if not dst_dir.is_dir():
+        raise HTTPException(400, "Destination is not a directory")
+    dst = dst_dir / src.name
+    if dst.exists():
+        raise HTTPException(400, "Destination already exists")
+    if src.is_dir():
+        shutil.copytree(src, dst)
+    else:
+        shutil.copy2(src, dst)
+    return {"ok": True}
+
+
+@app.get("/api/read")
+async def read_file(path: str = ""):
+    p = safe_path(path)
+    if not p.is_file():
+        raise HTTPException(400, "Not a file")
     try:
-        target = safe_child(destination, source.name)
-        shutil.move(str(source), str(target))
-        audit(request, "move", relative_path(source), {"to": relative_path(target)})
-        return stat_item(target)
-    except Exception as exc:
-        raise human_error(exc)
+        content = p.read_text(encoding='utf-8')
+    except UnicodeDecodeError:
+        raise HTTPException(400, "Binary file not supported for reading")
+    return {"content": content}
 
 
-@app.delete("/api/file")
-async def delete_path(path: str, request: Request, _auth: None = Depends(require_auth)):
-    target = safe_path(path)
-    if target == ROOT_DIR:
-        raise HTTPException(status_code=400, detail="The root directory cannot be deleted")
-    if not target.exists():
-        raise HTTPException(status_code=404, detail="Path not found")
-    try:
-        if target.is_dir():
-            shutil.rmtree(target)
-        else:
-            target.unlink()
-        audit(request, "delete", relative_path(target))
-        return {"ok": True}
-    except Exception as exc:
-        raise human_error(exc)
+class WriteRequest(BaseModel):
+    path: str
+    content: str
+
+@app.post("/api/write")
+async def write_file(req: WriteRequest):
+    p = safe_path(req.path)
+    if not p.is_file():
+        raise HTTPException(400, "Not a file")
+    p.write_text(req.content, encoding='utf-8')
+    return {"ok": True}
 
 
-@app.post("/api/extract")
-async def extract_archive(payload: dict, request: Request, _auth: None = Depends(require_auth)):
-    archive = safe_path(str(payload.get("path", "")))
-    if not archive.is_file() or archive.suffix.lower() != ".zip":
-        raise HTTPException(status_code=400, detail="Only ZIP archives are supported")
-    destination = safe_child(archive.parent, archive.stem)
-    try:
-        destination.mkdir(exist_ok=False)
-        with zipfile.ZipFile(archive) as zf:
-            for member in zf.infolist():
-                member_target = (destination / member.filename).resolve()
-                if member_target != destination and destination not in member_target.parents:
-                    raise HTTPException(status_code=400, detail="Archive contains an unsafe path")
-            zf.extractall(destination)
-        audit(request, "extract", relative_path(archive), {"to": relative_path(destination)})
-        return {"ok": True, "path": relative_path(destination)}
-    except Exception as exc:
-        shutil.rmtree(destination, ignore_errors=True)
-        raise human_error(exc)
-
-
-@app.get("/api/audit")
-async def audit_log(request: Request, _auth: None = Depends(require_auth), limit: int = Query(100, ge=1, le=500)):
-    if not AUDIT_FILE.exists():
-        return {"events": []}
-    try:
-        lines = AUDIT_FILE.read_text(encoding="utf-8").splitlines()[-limit:]
-        events = [json.loads(line) for line in reversed(lines)]
-        return {"events": events}
-    except Exception as exc:
-        raise human_error(exc)
-
+# -----------------------------------------------------------------------------
+# Web terminal WebSocket endpoint
+# -----------------------------------------------------------------------------
 
 @app.websocket("/ws/terminal")
-async def terminal(websocket: WebSocket):
-    session = websocket.scope.get("session", {})
-    if not session.get("authenticated"):
-        await websocket.close(code=4401)
-        return
-    origin = websocket.headers.get("origin")
-    host = websocket.headers.get("host")
-    if origin and host and origin.split("//", 1)[-1].split("/", 1)[0] != host:
-        await websocket.close(code=4403)
-        return
+async def terminal_ws(websocket: WebSocket):
     await websocket.accept()
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.environ["TERM"] = "xterm-256color"
-        os.environ["FILE_MANAGER_ROOT"] = str(ROOT_DIR)
-        os.chdir(ROOT_DIR)
-        os.execv(TERMINAL_SHELL, [TERMINAL_SHELL, "-i"])
-    os.set_blocking(fd, False)
-    audit(None, "terminal_open")
+
+    if sys.platform == "win32":
+        await websocket.send_text(json.dumps({"type": "output", "data": "Terminal not supported on Windows."}))
+        await websocket.close()
+        return
+
+    # Spawn a shell inside a PTY
+    master, slave = pty.openpty()
+    proc = subprocess.Popen(
+        ["/bin/bash"],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        start_new_session=True,
+        env={**os.environ, "TERM": "xterm-256color", "COLUMNS": "80", "LINES": "24"},
+        cwd=str(ROOT_DIR)
+    )
+    os.close(slave)
+
+    # Set master to non-blocking
+    flags = fcntl.fcntl(master, fcntl.F_GETFL)
+    fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    loop = asyncio.get_event_loop()
+    output_queue = asyncio.Queue()
+
+    def on_output():
+        try:
+            data = os.read(master, 65536)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
+        if data:
+            output_queue.put_nowait(data)
+        else:
+            output_queue.put_nowait(None)
+
+    loop.add_reader(master, on_output)
 
     async def send_output():
-        while True:
-            ready, _, _ = select.select([fd], [], [], 0.1)
-            if ready:
-                try:
-                    chunk = os.read(fd, 65536)
-                    if not chunk:
-                        break
-                    await websocket.send_text(base64.b64encode(chunk).decode("ascii"))
-                except (OSError, WebSocketDisconnect):
+        try:
+            while True:
+                data = await output_queue.get()
+                if data is None:
                     break
-            await asyncio.sleep(0)
+                await websocket.send_text(json.dumps({"type": "output", "data": data.decode('utf-8', 'replace')}))
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
 
-    output_task = asyncio.create_task(send_output())
+    send_task = asyncio.create_task(send_output())
+
     try:
         while True:
-            message = await websocket.receive()
-            if message.get("type") == "websocket.disconnect":
-                break
-            if message.get("text") is not None:
-                payload = json.loads(message["text"])
-                if payload.get("type") == "input":
-                    os.write(fd, base64.b64decode(payload.get("data", "")))
-                elif payload.get("type") == "resize":
-                    rows = max(1, min(200, int(payload.get("rows", 30))))
-                    cols = max(1, min(300, int(payload.get("cols", 120))))
-                    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-    except (WebSocketDisconnect, json.JSONDecodeError, OSError):
+            msg = await websocket.receive_text()
+            try:
+                data = json.loads(msg)
+            except:
+                continue
+            if data.get("type") == "input":
+                input_data = data.get("data", "")
+                os.write(master, input_data.encode())
+            elif data.get("type") == "resize":
+                cols = int(data.get("cols", 80))
+                rows = int(data.get("rows", 24))
+                winsize = struct.pack("HHHH", rows, cols, 0, 0)
+                fcntl.ioctl(master, termios.TIOCSWINSZ, winsize)
+    except WebSocketDisconnect:
         pass
     finally:
-        output_task.cancel()
+        loop.remove_reader(master)
+        send_task.cancel()
         try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except:
             pass
         try:
-            os.close(fd)
-        except OSError:
+            os.close(master)
+        except:
             pass
-        await asyncio.sleep(0)
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "time": utc_now()}
+        try:
+            await send_task
+        except asyncio.CancelledError:
+            pass
