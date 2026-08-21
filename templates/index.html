@@ -1,150 +1,109 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta
-        name="viewport"
-        content="width=device-width, initial-scale=1.0"
-    >
-
-    <title>File Manager</title>
-
-    <link
-        rel="stylesheet"
-        href="/static/style.css"
-    >
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ app_name }}</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/IBM-Plex/6.0.0/css/ibm-plex.min.css">
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/xterm/5.5.0/css/xterm.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/dracula.min.css">
 </head>
-
 <body>
+<div class="app" id="app"
+     data-csrf="{{ csrf_token }}"
+     data-username="{{ username }}"
+     data-terminal-enabled="{{ 'true' if terminal_enabled else 'false' }}">
 
-<header class="header">
+  <!-- Top toolbar -->
+  <header class="topbar">
+    <span class="brand">◆ {{ app_name }}</span>
 
-    <div>
-        <h1>📁 File Manager</h1>
-        <span id="currentPath">/</span>
+    <div class="toolbar">
+      <button class="btn" id="btnNewFolder" title="New folder">📁+ <span class="label-text">Folder</span></button>
+      <button class="btn" id="btnUpload" title="Upload files">⬆ <span class="label-text">Upload</span></button>
+      <input type="file" id="fileInput" multiple class="hidden">
+      <div class="sep"></div>
+      <button class="btn" id="btnDownload" title="Download selected" disabled>⬇ <span class="label-text">Download</span></button>
+      <button class="btn" id="btnCut" title="Cut" disabled>✂ <span class="label-text">Cut</span></button>
+      <button class="btn" id="btnCopy" title="Copy" disabled>⧉ <span class="label-text">Copy</span></button>
+      <button class="btn" id="btnPaste" title="Paste" disabled>📋 <span class="label-text">Paste</span></button>
+      <button class="btn" id="btnCompress" title="Compress to .zip" disabled>🗜 <span class="label-text">Zip</span></button>
+      <button class="btn btn-danger" id="btnDelete" title="Delete selected" disabled>🗑 <span class="label-text">Delete</span></button>
     </div>
 
-    <div class="header-actions">
+    <div class="spacer"></div>
 
-        <button onclick="goBack()">
-            ← Back
-        </button>
-
-        <button onclick="createFolder()">
-            + Folder
-        </button>
-
-        <label class="upload-btn">
-            ⬆ Upload
-            <input
-                type="file"
-                id="fileInput"
-                multiple
-                hidden
-            >
-        </label>
-
+    <div class="search-box">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      <input type="text" id="searchInput" placeholder="search this folder…">
     </div>
 
-</header>
+    {% if terminal_enabled %}
+    <button class="btn" id="btnTerminal" title="Toggle terminal">▮ <span class="label-text">Terminal</span></button>
+    {% endif %}
 
+    <span class="user-chip">{{ username }}</span>
+    <button class="btn btn-icon" id="btnLogout" title="Log out">⏻</button>
+  </header>
 
-<main>
+  <!-- Prompt-style breadcrumb -->
+  <div class="prompt-bar" id="promptBar"></div>
 
-    <section class="stats">
+  <!-- File listing -->
+  <main class="content" id="content">
+    <div class="drop-overlay hidden" id="dropOverlay">drop files to upload here</div>
+    <table class="file-table">
+      <thead>
+        <tr>
+          <th class="col-check"><input type="checkbox" id="selectAll"></th>
+          <th>Name</th>
+          <th class="col-size">Size</th>
+          <th class="col-modified">Modified</th>
+        </tr>
+      </thead>
+      <tbody id="fileTableBody"></tbody>
+    </table>
+    <div class="empty-state hidden" id="emptyState">this folder is empty</div>
+    <div class="loading-state" id="loadingState">loading…</div>
+  </main>
 
-        <div class="stat">
-            <span>Files</span>
-            <strong id="fileCount">0</strong>
-        </div>
+  <div class="statusbar">
+    <span id="statusLeft">0 items</span>
+    <span id="statusRight"></span>
+  </div>
 
-        <div class="stat">
-            <span>Folders</span>
-            <strong id="folderCount">0</strong>
-        </div>
-
-        <div class="stat">
-            <span>Storage</span>
-            <strong id="storageSize">0 B</strong>
-        </div>
-
-    </section>
-
-
-    <section class="toolbar">
-
-        <input
-            id="search"
-            type="search"
-            placeholder="Search files..."
-            oninput="renderFiles()"
-        >
-
-    </section>
-
-
-    <section class="file-container">
-
-        <div class="file-header">
-            <span>Name</span>
-            <span>Size</span>
-            <span>Actions</span>
-        </div>
-
-        <div id="fileList"></div>
-
-    </section>
-
-</main>
-
-
-<!-- Editor -->
-
-<div
-    id="editorModal"
-    class="modal hidden"
->
-
-    <div class="modal-content editor">
-
-        <div class="modal-header">
-
-            <h2 id="editorTitle">
-                Edit file
-            </h2>
-
-            <button onclick="closeEditor()">
-                ✕
-            </button>
-
-        </div>
-
-        <textarea
-            id="editorContent"
-            spellcheck="false"
-        ></textarea>
-
-        <div class="modal-footer">
-
-            <button onclick="closeEditor()">
-                Cancel
-            </button>
-
-            <button
-                class="primary"
-                onclick="saveEditor()"
-            >
-                Save
-            </button>
-
-        </div>
-
+  <!-- Terminal drawer -->
+  {% if terminal_enabled %}
+  <div class="terminal-drawer" id="terminalDrawer">
+    <div class="terminal-drawer-header" id="terminalDragHandle">
+      <span class="dot disconnected" id="termStatusDot"></span>
+      <span id="termStatusText">terminal — disconnected</span>
+      <div class="spacer"></div>
+      <button class="btn btn-icon" id="btnCloseTerminal" title="Close">✕</button>
     </div>
-
+    <div class="terminal-body" id="terminalBody"></div>
+  </div>
+  {% endif %}
 </div>
 
+<div class="toast-stack" id="toastStack"></div>
+<div id="modalRoot"></div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xterm/5.5.0/xterm.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xterm/5.5.0/addons/fit/addon-fit.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/meta.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/xml/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/css/css.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/htmlmixed/htmlmixed.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/markdown/markdown.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/shell/shell.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/sql/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/yaml/yaml.min.js"></script>
 <script src="/static/app.js"></script>
-
 </body>
 </html>

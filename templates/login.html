@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ app_name }} — Sign in</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/IBM-Plex/6.0.0/css/ibm-plex.min.css">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="login-screen">
+    <div class="login-card">
+      <p class="login-prompt">// authentication required</p>
+      <h1 class="login-title">{{ app_name }}<span class="cursor-block"></span></h1>
+
+      <div id="loginError" class="login-error hidden"></div>
+
+      <form id="loginForm" autocomplete="off">
+        <div class="field">
+          <label for="username">username</label>
+          <input type="text" id="username" name="username" autocomplete="username" required autofocus>
+        </div>
+        <div class="field">
+          <label for="password">password</label>
+          <input type="password" id="password" name="password" autocomplete="current-password" required>
+        </div>
+        <button type="submit" class="btn btn-primary btn-block" id="loginBtn">sign in</button>
+      </form>
+
+      <p class="login-hint">Sessions expire automatically. Repeated failed attempts will temporarily lock this account out.</p>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('loginForm');
+    const errBox = document.getElementById('loginError');
+    const btn = document.getElementById('loginBtn');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errBox.classList.add('hidden');
+      btn.disabled = true;
+      btn.textContent = 'signing in…';
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('username').value,
+            password: document.getElementById('password').value,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Login failed');
+        window.location.href = '/';
+      } catch (err) {
+        errBox.textContent = err.message;
+        errBox.classList.remove('hidden');
+        btn.disabled = false;
+        btn.textContent = 'sign in';
+      }
+    });
+  </script>
+</body>
+</html>
