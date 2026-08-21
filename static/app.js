@@ -46,7 +46,7 @@ window.addEventListener('resize', () => {
     if (wasMobile !== isMobile) {
         loadFiles(currentPath);
     }
-    if (terminals[activeTerminalId]?.fit) {
+    if (activeTerminalId && terminals[activeTerminalId] && terminals[activeTerminalId].fit) {
         terminals[activeTerminalId].fit.fit();
     }
 });
@@ -1104,6 +1104,13 @@ function toggleTerminal() {
 }
 
 function newTerminalTab() {
+    // Check if Terminal is loaded
+    if (typeof window.Terminal === 'undefined') {
+        showToast('Terminal library not loaded. Please refresh the page.', 'error');
+        console.error('Terminal not found. Available globals:', Object.keys(window).filter(k => k.toLowerCase().includes('term')));
+        return;
+    }
+
     terminalTabCount++;
     const tabId = `term-${terminalTabCount}`;
 
@@ -1113,7 +1120,7 @@ function newTerminalTab() {
     tab.innerHTML = `
         <i class="fas fa-terminal"></i>
         <span>bash-${terminalTabCount}</span>
-        <button class="tab-close" onclick="closeTerminalTab('${tabId}')"><i class="fas fa-times"></i></button>
+        <button class="tab-close" onclick="event.stopPropagation(); closeTerminalTab('${tabId}')"><i class="fas fa-times"></i></button>
     `;
     tab.onclick = (e) => {
         if (!e.target.closest('.tab-close')) switchTerminalTab(tabId);
@@ -1132,10 +1139,22 @@ function newTerminalTab() {
     Array.from(container.children).forEach(c => c.style.display = 'none');
     container.appendChild(termDiv);
 
-    const term = new Terminal({
+    // Initialize terminal with FitAddon
+    let fitAddon = null;
+    try {
+        // xterm 5.x addon CDN exposes as window.FitAddon.FitAddon
+        const FitAddonClass = window.FitAddon?.FitAddon || window.FitAddon;
+        if (FitAddonClass) {
+            fitAddon = new FitAddonClass();
+        }
+    } catch (e) {
+        console.warn('FitAddon not available:', e);
+    }
+
+    const term = new window.Terminal({
         cursorBlink: true,
         fontSize: 14,
-        fontFamily: 'JetBrains Mono, Fira Code, Consolas, monospace',
+        fontFamily: 'Consolas, "Courier New", monospace',
         theme: getTerminalTheme(),
         cols: 80,
         rows: 24,
@@ -1143,10 +1162,15 @@ function newTerminalTab() {
         scrollback: 10000
     });
 
-    const fit = new FitAddon.FitAddon();
-    term.loadAddon(fit);
+    if (fitAddon) {
+        term.loadAddon(fitAddon);
+    }
+
     term.open(termDiv);
-    fit.fit();
+
+    if (fitAddon) {
+        setTimeout(() => fitAddon.fit(), 50);
+    }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${protocol}//${window.location.host}/ws/terminal`);
@@ -1180,12 +1204,16 @@ function newTerminalTab() {
         }
     });
 
-    terminals[tabId] = { term, fit, ws, div: termDiv };
+    terminals[tabId] = { term, fit: fitAddon, ws, div: termDiv };
     activeTerminalId = tabId;
 
-    window.addEventListener('resize', () => {
-        if (terminals[tabId]) terminals[tabId].fit.fit();
-    });
+    const resizeHandler = () => {
+        if (terminals[tabId] && terminals[tabId].fit) {
+            terminals[tabId].fit.fit();
+        }
+    };
+    window.addEventListener('resize', resizeHandler);
+    terminals[tabId].resizeHandler = resizeHandler;
 }
 
 function switchTerminalTab(tabId) {
@@ -1196,12 +1224,17 @@ function switchTerminalTab(tabId) {
     if (terminals[tabId]) {
         terminals[tabId].div.style.display = 'block';
         activeTerminalId = tabId;
-        setTimeout(() => terminals[tabId].fit.fit(), 50);
+        if (terminals[tabId].fit) {
+            setTimeout(() => terminals[tabId].fit.fit(), 50);
+        }
     }
 }
 
 function closeTerminalTab(tabId) {
     if (terminals[tabId]) {
+        if (terminals[tabId].resizeHandler) {
+            window.removeEventListener('resize', terminals[tabId].resizeHandler);
+        }
         terminals[tabId].ws.close();
         terminals[tabId].term.dispose();
         terminals[tabId].div.remove();
@@ -1241,7 +1274,7 @@ function toggleTerminalSize() {
     terminalPanel.classList.toggle('maximized');
     const icon = document.getElementById('terminalSizeIcon');
     icon.className = terminalPanel.classList.contains('maximized') ? 'fas fa-compress' : 'fas fa-expand';
-    if (activeTerminalId && terminals[activeTerminalId]) {
+    if (activeTerminalId && terminals[activeTerminalId] && terminals[activeTerminalId].fit) {
         setTimeout(() => terminals[activeTerminalId].fit.fit(), 200);
     }
 }

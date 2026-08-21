@@ -8,6 +8,14 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/xterm/5.3.0/xterm.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xterm/5.3.0/xterm.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xterm/5.3.0/addons/fit/xterm-addon-fit.min.js"></script>
+    <script>
+        // Ensure FitAddon is available globally
+        window.addEventListener('load', function() {
+            if (typeof FitAddon === 'undefined' && typeof window.FitAddon === 'undefined') {
+                console.warn('FitAddon not loaded from CDN, terminal resize disabled');
+            }
+        });
+    </script>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
